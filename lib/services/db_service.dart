@@ -1,13 +1,13 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/movie.dart';
 
 class DbService {
   static Database? _db;
   static final List<Movie> _webMovieCache = [];
-  static final List<Movie> _webDownloadedMovies = [];
-  static final List<Movie> _webFavorites = [];
 
   static Future<Database> get database async {
     if (_db != null) return _db!;
@@ -65,7 +65,7 @@ class DbService {
     );
   }
 
-  //========================= Cache list of movies ========================================
+  // ============================ Movie Cache helpers ============================
   static Future<void> cacheMovies(List<Movie> movies, int page) async {
     if (kIsWeb) {
       for (final movie in movies) {
@@ -75,11 +75,10 @@ class DbService {
       }
       return;
     }
-    
+
     final db = await database;
     final batch = db.batch();
-
-    for (final movie in movies) {
+    for (var movie in movies) {
       batch.insert(
         'cached_movies',
         {
@@ -96,50 +95,33 @@ class DbService {
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
     }
-
     await batch.commit(noResult: true);
   }
 
-  //========================= Retrieve cached movies page-by-page ========================================
-  static Future<List<Movie>> getCachedMovies({required int page, int limit = 20}) async {
+  static Future<List<Movie>> getCachedMovies({required int page}) async {
     if (kIsWeb) {
-      final int offset = (page - 1) * limit;
-      if (offset >= _webMovieCache.length) return [];
-      final end = offset + limit > _webMovieCache.length ? _webMovieCache.length : offset + limit;
-      return _webMovieCache.sublist(offset, end);
+      final int start = (page - 1) * 10;
+      if (start >= _webMovieCache.length) return [];
+      final int end = start + 10 > _webMovieCache.length ? _webMovieCache.length : start + 10;
+      return _webMovieCache.sublist(start, end);
     }
 
     final db = await database;
-    final int offset = (page - 1) * limit;
-
-    //========================== First try querying by page ======================================
     final List<Map<String, dynamic>> maps = await db.query(
       'cached_movies',
       where: 'page = ?',
       whereArgs: [page],
-      limit: limit,
     );
 
-    if (maps.isNotEmpty) {
-      return maps.map((map) => Movie.fromJson(map)).toList();
-    }
-
-    //====================== Fallback to offset query if pages aren't cleanly saved ===========================
-    final List<Map<String, dynamic>> fallbackMaps = await db.query(
-      'cached_movies',
-      orderBy: 'id ASC',
-      limit: limit,
-      offset: offset,
-    );
-
-    return fallbackMaps.map((map) => Movie.fromJson(map)).toList();
+    return List.generate(maps.length, (i) {
+      return Movie.fromJson(maps[i]);
+    });
   }
 
-  //===================== Retrieve specific movie detail =============================================
   static Future<Movie?> getCachedMovie(String id) async {
     if (kIsWeb) {
-      final match = _webMovieCache.where((m) => m.id == id);
-      return match.isNotEmpty ? match.first : null;
+      final idx = _webMovieCache.indexWhere((m) => m.id == id);
+      return idx != -1 ? _webMovieCache[idx] : null;
     }
 
     final db = await database;
@@ -156,7 +138,6 @@ class DbService {
     return null;
   }
 
-  //========================= Clear cached movies ============================================
   static Future<void> clearCache() async {
     if (kIsWeb) {
       _webMovieCache.clear();
@@ -167,11 +148,20 @@ class DbService {
     await db.delete('cached_movies');
   }
 
-  //============================ Save a downloaded movie ===============================================
+  // ============================ Downloaded Movies Persistent Web helpers ============================
   static Future<void> saveDownloadedMovie(Movie movie, String localPath) async {
     if (kIsWeb) {
-      if (!_webDownloadedMovies.any((m) => m.id == movie.id)) {
-        _webDownloadedMovies.add(movie);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_downloads') ?? [];
+      final bool exists = list.any((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return map['id'] == movie.id;
+      });
+      if (!exists) {
+        final map = movie.toJson();
+        map['localPath'] = localPath;
+        list.add(jsonEncode(map));
+        await prefs.setStringList('web_downloads', list);
       }
       return;
     }
@@ -194,10 +184,15 @@ class DbService {
     );
   }
 
-  // Delete a downloaded movie
   static Future<void> deleteDownloadedMovie(String id) async {
     if (kIsWeb) {
-      _webDownloadedMovies.removeWhere((m) => m.id == id);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_downloads') ?? [];
+      list.removeWhere((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return map['id'] == id;
+      });
+      await prefs.setStringList('web_downloads', list);
       return;
     }
 
@@ -209,19 +204,12 @@ class DbService {
     );
   }
 
-  // Retrieve all downloaded movies
   static Future<List<Map<String, dynamic>>> getDownloadedMovies() async {
     if (kIsWeb) {
-      return _webDownloadedMovies.map((movie) => {
-        'id': movie.id,
-        'title': movie.title,
-        'overview': movie.overview,
-        'posterUrl': movie.posterUrl,
-        'videoUrl': movie.videoUrl,
-        'releaseDate': movie.releaseDate,
-        'duration': movie.duration,
-        'rating': movie.rating,
-        'localPath': '',
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_downloads') ?? [];
+      return list.map((item) {
+        return jsonDecode(item) as Map<String, dynamic>;
       }).toList();
     }
 
@@ -229,10 +217,14 @@ class DbService {
     return await db.query('downloaded_movies');
   }
 
-  // Check if a movie is downloaded
   static Future<bool> isMovieDownloaded(String id) async {
     if (kIsWeb) {
-      return _webDownloadedMovies.any((m) => m.id == id);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_downloads') ?? [];
+      return list.any((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return map['id'] == id;
+      });
     }
 
     final db = await database;
@@ -245,11 +237,18 @@ class DbService {
     return maps.isNotEmpty;
   }
 
-  // Save a movie to favorites
+  // ============================ Favorite Movies Persistent Web helpers ============================
   static Future<void> saveFavorite(Movie movie) async {
     if (kIsWeb) {
-      if (!_webFavorites.any((m) => m.id == movie.id)) {
-        _webFavorites.add(movie);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_favorites') ?? [];
+      final bool exists = list.any((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return map['id'] == movie.id;
+      });
+      if (!exists) {
+        list.add(jsonEncode(movie.toJson()));
+        await prefs.setStringList('web_favorites', list);
       }
       return;
     }
@@ -271,10 +270,15 @@ class DbService {
     );
   }
 
-  // Remove a movie from favorites
   static Future<void> removeFavorite(String id) async {
     if (kIsWeb) {
-      _webFavorites.removeWhere((m) => m.id == id);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_favorites') ?? [];
+      list.removeWhere((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return map['id'] == id;
+      });
+      await prefs.setStringList('web_favorites', list);
       return;
     }
 
@@ -286,10 +290,14 @@ class DbService {
     );
   }
 
-  // Retrieve all favorite movies
   static Future<List<Movie>> getFavorites() async {
     if (kIsWeb) {
-      return List.from(_webFavorites);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_favorites') ?? [];
+      return list.map((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return Movie.fromJson(map);
+      }).toList();
     }
 
     final db = await database;
@@ -297,10 +305,14 @@ class DbService {
     return maps.map((map) => Movie.fromJson(map)).toList();
   }
 
-  // Check if a movie is favorited
   static Future<bool> isFavorite(String id) async {
     if (kIsWeb) {
-      return _webFavorites.any((m) => m.id == id);
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> list = prefs.getStringList('web_favorites') ?? [];
+      return list.any((item) {
+        final map = jsonDecode(item) as Map<String, dynamic>;
+        return map['id'] == id;
+      });
     }
 
     final db = await database;
