@@ -45,6 +45,7 @@ dependencies:
   simple_pip_mode: ^1.1.0
   flutter_screenutil: ^5.9.3
   url_launcher: ^6.3.2
+  shared_preferences: ^2.5.5
 
 dev_dependencies:
   flutter_test:
